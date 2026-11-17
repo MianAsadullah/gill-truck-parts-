@@ -1,0 +1,1012 @@
+// Gill Truck Parts — Enterprise Management System
+// Prisma schema. Datasource is PostgreSQL (Supabase-compatible).
+//
+// MONEY: every monetary column is Decimal(14,4). Never use Float for money.
+// QUANTITY: Decimal(14,4) so fractional units (fluid oz, feet of hose) work.
+//
+// SECURITY NOTE ON COST FIELDS
+// ----------------------------
+// Product.averageCost / lastCost / standardCost are COST-BEARING columns.
+// They must never be serialized to a client whose role lacks
+// PERM.INVENTORY_VIEW_COST. Enforcement lives in src/lib/product-dto.ts
+// (toProductDTO) which is the ONLY sanctioned way to send a Product to the
+// browser, plus Postgres row-level security policies in
+// prisma/migrations/*_rls_cost_protection for direct/Supabase API access.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────────────────────────────────────── SECURITY (SEC)
+
+enum RoleCode {
+  ADMIN
+  ACCOUNTANT
+  MANAGER
+  PURCHASING
+  COUNTER_SALES
+  VIEWER
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  code        RoleCode @unique
+  name        String
+  description String?
+  // Hard ceiling used by the pricing engine: a role may never approve an
+  // override discount deeper than this fraction (0.25 = 25% below minimum).
+  maxDiscountPct Decimal @default(0) @db.Decimal(5, 4)
+  isSystem    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  users       User[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String  @id @default(cuid())
+  // Dotted key, e.g. "inventory.view_cost". Mirrors PERM in src/lib/permissions.ts
+  key         String  @unique
+  description String
+  category    String
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  employeeCode String   @unique // "Rep" initials shown on invoices, e.g. "JG"
+  email        String   @unique
+  fullName     String
+  passwordHash String
+  // Short numeric code a manager types into the override dialog at the
+  // counter without handing over their password. Hashed, never plaintext.
+  overrideCodeHash String?
+  roleId       String
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  role Role @relation(fields: [roleId], references: [id])
+
+  invoicesCreated   Invoice[]        @relation("InvoiceCreatedBy")
+  invoicesRepped    Invoice[]        @relation("InvoiceRep")
+  purchaseOrders    PurchaseOrder[]
+  auditLogs         AuditLog[]
+  overridesRequested PriceOverride[] @relation("OverrideRequestedBy")
+  overridesApproved  PriceOverride[] @relation("OverrideApprovedBy")
+  journalEntries    JournalEntry[]
+  sessions          Session[]
+  receipts          Receipt[]       @relation("ReceiptCreatedBy")
+  inventoryMoves    InventoryMovement[] @relation("MovementCreatedBy")
+  customerPayments  CustomerPayment[]   @relation("CustomerPaymentCreatedBy")
+  billPayments      BillPayment[]       @relation("BillPaymentCreatedBy")
+
+  @@index([roleId])
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// ──────────────────────────────────────────────── PRODUCT MASTER / INVENTORY
+
+enum ItemType {
+  INVENTORY     // stocked part, decrements QtyOnHand, posts COGS
+  NON_INVENTORY // drop-ship / consumable, no stock tracking
+  SERVICE       // labor, shop supplies, diagnostics — never touches inventory
+  OTHER_CHARGE  // freight, core charge, environmental fee
+}
+
+model Category {
+  id       String  @id @default(cuid())
+  code     String  @unique
+  name     String
+  parentId String?
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@map("categories")
+}
+
+model Brand {
+  id       String    @id @default(cuid())
+  code     String    @unique
+  name     String
+  products Product[]
+
+  @@map("brands")
+}
+
+model Product {
+  id          String   @id @default(cuid())
+  sku         String   @unique // internal SKU
+  type        ItemType @default(INVENTORY)
+  description String              // short line that lands on the invoice
+  longDescription String?
+  categoryId  String?
+  brandId     String?
+  unitOfMeasure String @default("EA")
+  barcode     String?  @unique
+  binLocation String?
+
+  // ── Selling prices (visible to COUNTER_SALES) ─────────────────────────
+  standardPrice Decimal @db.Decimal(14, 4) // default sell / list
+  // The floor. Selling below this is BLOCKED unless a manager supplies an
+  // override code. Enforced in src/lib/pricing.ts on the server.
+  minimumPrice  Decimal @db.Decimal(14, 4)
+
+  // ── Costs (NEVER exposed to COUNTER_SALES — see header note) ──────────
+  averageCost Decimal @default(0) @db.Decimal(14, 4) // weighted average
+  lastCost    Decimal @default(0) @db.Decimal(14, 4) // most recent receipt
+  standardCost Decimal @default(0) @db.Decimal(14, 4)
+
+  // ── Stock ─────────────────────────────────────────────────────────────
+  quantityOnHand    Decimal @default(0) @db.Decimal(14, 4)
+  quantityOnOrder   Decimal @default(0) @db.Decimal(14, 4)
+  quantityCommitted Decimal @default(0) @db.Decimal(14, 4)
+  reorderPoint      Decimal @default(0) @db.Decimal(14, 4)
+  reorderQuantity   Decimal @default(0) @db.Decimal(14, 4)
+
+  isTaxable  Boolean @default(true)
+  isActive   Boolean @default(true)
+  // Core charge for rebuildable units (starters, alternators, turbos)
+  coreCharge Decimal @default(0) @db.Decimal(14, 4)
+
+  preferredVendorId String?
+
+  // GL accounts this item posts to
+  incomeAccountId    String?
+  cogsAccountId      String?
+  inventoryAccountId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  category        Category? @relation(fields: [categoryId], references: [id])
+  brand           Brand?    @relation(fields: [brandId], references: [id])
+  preferredVendor Vendor?   @relation(fields: [preferredVendorId], references: [id])
+  incomeAccount    Account? @relation("ItemIncome", fields: [incomeAccountId], references: [id])
+  cogsAccount      Account? @relation("ItemCogs", fields: [cogsAccountId], references: [id])
+  inventoryAccount Account? @relation("ItemInventory", fields: [inventoryAccountId], references: [id])
+
+  crossReferences ProductCrossReference[]
+  invoiceLines    InvoiceLine[]
+  poLines         PurchaseOrderLine[]
+  movements       InventoryMovement[]
+  priceOverrides  PriceOverride[]
+  customerPrices  CustomerPrice[]
+
+  @@index([categoryId])
+  @@index([brandId])
+  @@index([description])
+  @@index([isActive, type])
+  @@map("products")
+}
+
+enum CrossRefType {
+  OEM
+  ALTERNATE
+  SUPERSEDED
+  INTERCHANGE
+  VENDOR_PART
+}
+
+// OEM / alternate / interchange numbers. A counter employee types any of
+// these and the part must come up — this is the backbone of counter lookup.
+model ProductCrossReference {
+  id        String       @id @default(cuid())
+  productId String
+  type      CrossRefType
+  number    String
+  // Normalized: uppercased, punctuation stripped, so "RE-5-0749" matches
+  // "re50749". Lookup always queries this column.
+  normalized String
+  manufacturer String?
+  notes     String?
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, type, number])
+  @@index([normalized])
+  @@map("product_cross_references")
+}
+
+enum MovementType {
+  SALE
+  SALE_RETURN
+  RECEIPT
+  RECEIPT_RETURN
+  ADJUSTMENT
+  TRANSFER
+  COUNT
+}
+
+// Immutable inventory ledger. Every change to quantityOnHand writes a row
+// here in the same transaction, so stock is always reconstructable.
+model InventoryMovement {
+  id           String       @id @default(cuid())
+  productId    String
+  type         MovementType
+  quantity     Decimal      @db.Decimal(14, 4) // signed: -3 sold, +10 received
+  unitCost     Decimal      @db.Decimal(14, 4)
+  balanceAfter Decimal      @db.Decimal(14, 4)
+  referenceType String?     // "INVOICE" | "PO_RECEIPT" | "ADJUSTMENT"
+  referenceId   String?
+  referenceNumber String?
+  memo         String?
+  occurredAt   DateTime     @default(now())
+  createdById  String?
+
+  product   Product @relation(fields: [productId], references: [id])
+  createdBy User?   @relation("MovementCreatedBy", fields: [createdById], references: [id])
+
+  @@index([productId, occurredAt])
+  @@index([referenceType, referenceId])
+  @@map("inventory_movements")
+}
+
+// ───────────────────────────────────────────────────── CUSTOMERS / RECEIVABLE
+
+enum PriceLevel {
+  RETAIL
+  FLEET
+  WHOLESALE
+  DEALER
+}
+
+model Customer {
+  id          String @id @default(cuid())
+  customerNo  String @unique
+  companyName String
+  contactName String?
+  email       String?
+  phone       String?
+  billingAddress1 String?
+  billingAddress2 String?
+  city        String?
+  state       String?
+  postalCode  String?
+
+  termsId     String?
+  priceLevel  PriceLevel @default(RETAIL)
+  // Percent off standardPrice for this customer's level. The pricing engine
+  // still clamps the result at Product.minimumPrice.
+  discountPct Decimal @default(0) @db.Decimal(5, 4)
+  creditLimit Decimal @default(0) @db.Decimal(14, 4)
+  balance     Decimal @default(0) @db.Decimal(14, 4)
+  taxExempt   Boolean @default(false)
+  resaleCertNo String?
+  taxCodeId   String?
+
+  isActive  Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  terms    Terms?    @relation(fields: [termsId], references: [id])
+  taxCode  TaxCode?  @relation(fields: [taxCodeId], references: [id])
+  invoices Invoice[]
+  payments CustomerPayment[]
+  vehicles CustomerVehicle[]
+  prices   CustomerPrice[]
+
+  @@index([companyName])
+  @@map("customers")
+}
+
+// Repair-shop reality: customers bring in trucks. Plate drives lookup.
+model CustomerVehicle {
+  id           String  @id @default(cuid())
+  customerId   String
+  licensePlate String
+  vin          String?
+  year         Int?
+  make         String?
+  model        String?
+  unitNumber   String?
+  engine       String?
+  odometer     Int?
+
+  customer Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+
+  @@index([licensePlate])
+  @@index([customerId])
+  @@map("customer_vehicles")
+}
+
+// Negotiated per-customer price on a specific part.
+model CustomerPrice {
+  id         String  @id @default(cuid())
+  customerId String
+  productId  String
+  price      Decimal @db.Decimal(14, 4)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, productId])
+  @@map("customer_prices")
+}
+
+model Terms {
+  id          String @id @default(cuid())
+  name        String @unique // "Net 30", "2% 10 Net 30", "Due on receipt"
+  netDays     Int    @default(0)
+  discountDays Int   @default(0)
+  discountPct Decimal @default(0) @db.Decimal(5, 4)
+
+  customers Customer[]
+  vendors   Vendor[]
+  invoices  Invoice[]
+  bills     Bill[]
+
+  @@map("terms")
+}
+
+model TaxCode {
+  id        String  @id @default(cuid())
+  code      String  @unique
+  name      String
+  rate      Decimal @db.Decimal(7, 6) // 0.072500 = 7.25%
+  agency    String?
+  isActive  Boolean @default(true)
+
+  customers Customer[]
+  invoices  Invoice[]
+
+  @@map("tax_codes")
+}
+
+// ───────────────────────────────────────────────────────── SALES / INVOICING
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+model Invoice {
+  id          String        @id @default(cuid())
+  invoiceNo   String        @unique
+  customerId  String
+  vehicleId   String?
+  // Denormalized so the plate still prints on the invoice even if the
+  // vehicle record is later edited or detached.
+  licensePlate String?
+  invoiceDate DateTime      @default(now())
+  dueDate     DateTime?
+  serviceDate DateTime?     // when the work was performed
+  termsId     String?
+  repId       String?       // the "Rep" column, QuickBooks-style
+  poNumber    String?       // customer's own PO
+  status      InvoiceStatus @default(DRAFT)
+
+  memo        String?
+  customerMessage String?
+
+  // Totals, all persisted (not recomputed on read) so a reprint of a 3-year
+  // old invoice is byte-identical to what the customer received.
+  subtotal     Decimal @db.Decimal(14, 4)
+  discountTotal Decimal @default(0) @db.Decimal(14, 4)
+  taxCodeId    String?
+  taxRate      Decimal @default(0) @db.Decimal(7, 6)
+  taxTotal     Decimal @default(0) @db.Decimal(14, 4)
+  total        Decimal @db.Decimal(14, 4)
+  amountPaid   Decimal @default(0) @db.Decimal(14, 4)
+  balanceDue   Decimal @default(0) @db.Decimal(14, 4)
+  // Snapshot of margin at time of sale. Managers/accountants only.
+  costTotal    Decimal @default(0) @db.Decimal(14, 4)
+
+  createdById String
+  postedAt    DateTime?
+  voidedAt    DateTime?
+  voidReason  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  customer Customer         @relation(fields: [customerId], references: [id])
+  vehicle  CustomerVehicle? @relation(fields: [vehicleId], references: [id])
+  terms    Terms?           @relation(fields: [termsId], references: [id])
+  taxCode  TaxCode?         @relation(fields: [taxCodeId], references: [id])
+  rep      User?            @relation("InvoiceRep", fields: [repId], references: [id])
+  createdBy User            @relation("InvoiceCreatedBy", fields: [createdById], references: [id])
+
+  lines          InvoiceLine[]
+  overrides      PriceOverride[]
+  journalEntries JournalEntry[]
+  payments       PaymentApplication[]
+
+  @@index([customerId, invoiceDate])
+  @@index([status])
+  @@index([invoiceDate])
+  @@map("invoices")
+}
+
+model InvoiceLine {
+  id        String @id @default(cuid())
+  invoiceId String
+  lineNo    Int
+
+  // NULL productId == a manual labor / service / misc line. The counter types
+  // a free-form description and rate; nothing is deducted from inventory.
+  productId String?
+  isManual  Boolean @default(false)
+  itemType  ItemType @default(INVENTORY)
+
+  // Snapshotted so historical invoices never drift when the product master
+  // is edited.
+  sku         String?
+  description String
+  quantity    Decimal @db.Decimal(14, 4)
+  unitOfMeasure String @default("EA")
+  rate        Decimal @db.Decimal(14, 4)
+  amount      Decimal @db.Decimal(14, 4) // quantity * rate, server-computed
+  isTaxable   Boolean @default(true)
+
+  // Cost snapshot — restricted column, stripped by toInvoiceDTO for roles
+  // without inventory.view_cost.
+  unitCost  Decimal @default(0) @db.Decimal(14, 4)
+  costAmount Decimal @default(0) @db.Decimal(14, 4)
+
+  // Set when this line's rate fell below Product.minimumPrice and a manager
+  // approved it. Points at the immutable PriceOverride record.
+  priceOverrideId String? @unique
+
+  product       Product?       @relation(fields: [productId], references: [id])
+  invoice       Invoice        @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  priceOverride PriceOverride? @relation(fields: [priceOverrideId], references: [id])
+
+  @@unique([invoiceId, lineNo])
+  @@index([productId])
+  @@map("invoice_lines")
+}
+
+// ───────────────────────────────────────────── PRICE OVERRIDE (SEC / AUDIT)
+
+// Immutable. One row per below-minimum sale, written in the same transaction
+// as the invoice. Deliberately has no updatedAt and no delete path.
+model PriceOverride {
+  id        String  @id @default(cuid())
+  invoiceId String?
+  productId String
+  sku       String
+  lineNo    Int?
+
+  minimumPrice   Decimal @db.Decimal(14, 4) // floor that was breached
+  standardPrice  Decimal @db.Decimal(14, 4)
+  approvedPrice  Decimal @db.Decimal(14, 4) // what was actually charged
+  quantity       Decimal @db.Decimal(14, 4)
+  // (minimumPrice - approvedPrice) * quantity — the dollars given away
+  concessionAmount Decimal @db.Decimal(14, 4)
+  discountPct    Decimal @db.Decimal(7, 6)
+
+  requestedById String
+  approvedById  String
+  reason        String
+  ipAddress     String?
+  createdAt     DateTime @default(now())
+
+  invoice     Invoice?     @relation(fields: [invoiceId], references: [id])
+  product     Product      @relation(fields: [productId], references: [id])
+  requestedBy User         @relation("OverrideRequestedBy", fields: [requestedById], references: [id])
+  approvedBy  User         @relation("OverrideApprovedBy", fields: [approvedById], references: [id])
+  invoiceLine InvoiceLine?
+
+  @@index([createdAt])
+  @@index([approvedById])
+  @@index([productId])
+  @@map("price_overrides")
+}
+
+// ────────────────────────────────────────────────── PURCHASING / VENDORS (PUR)
+
+model Vendor {
+  id         String @id @default(cuid())
+  vendorNo   String @unique
+  companyName String
+  contactName String?
+  email      String?
+  phone      String?
+  address1   String?
+  city       String?
+  state      String?
+  postalCode String?
+  termsId    String?
+  accountNo  String? // our account number with them
+  balance    Decimal @default(0) @db.Decimal(14, 4)
+  isActive   Boolean @default(true)
+  notes      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  terms          Terms?          @relation(fields: [termsId], references: [id])
+  purchaseOrders PurchaseOrder[]
+  bills          Bill[]
+  products       Product[]
+
+  @@index([companyName])
+  @@map("vendors")
+}
+
+enum POStatus {
+  DRAFT
+  OPEN
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id        String   @id @default(cuid())
+  poNumber  String   @unique
+  vendorId  String
+  orderDate DateTime @default(now())
+  expectedDate DateTime?
+  shipVia   String?
+  status    POStatus @default(DRAFT)
+  memo      String?
+
+  subtotal Decimal @db.Decimal(14, 4)
+  freight  Decimal @default(0) @db.Decimal(14, 4)
+  total    Decimal @db.Decimal(14, 4)
+
+  createdById String
+  closedAt    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  vendor    Vendor              @relation(fields: [vendorId], references: [id])
+  createdBy User                @relation(fields: [createdById], references: [id])
+  lines     PurchaseOrderLine[]
+  receipts  Receipt[]
+  bills     Bill[]
+
+  @@index([vendorId])
+  @@index([status])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderLine {
+  id        String @id @default(cuid())
+  poId      String
+  lineNo    Int
+  productId String?
+  sku       String?
+  description String
+  vendorPartNo String?
+
+  quantityOrdered  Decimal @db.Decimal(14, 4)
+  quantityReceived Decimal @default(0) @db.Decimal(14, 4)
+  quantityBilled   Decimal @default(0) @db.Decimal(14, 4)
+  unitCost Decimal @db.Decimal(14, 4)
+  amount   Decimal @db.Decimal(14, 4)
+
+  po       PurchaseOrder  @relation(fields: [poId], references: [id], onDelete: Cascade)
+  product  Product?       @relation(fields: [productId], references: [id])
+  receiptLines ReceiptLine[]
+
+  @@unique([poId, lineNo])
+  @@map("purchase_order_lines")
+}
+
+// A physical receipt against a PO. Partial receipts are the norm.
+model Receipt {
+  id            String   @id @default(cuid())
+  receiptNo     String   @unique
+  poId          String
+  receivedDate  DateTime @default(now())
+  vendorPackingSlip String?
+  memo          String?
+  // true once a Bill has been posted against this receipt
+  isBilled      Boolean  @default(false)
+  createdById   String
+  createdAt     DateTime @default(now())
+
+  po        PurchaseOrder @relation(fields: [poId], references: [id])
+  createdBy User          @relation("ReceiptCreatedBy", fields: [createdById], references: [id])
+  lines     ReceiptLine[]
+  bills     Bill[]
+
+  @@index([poId])
+  @@map("receipts")
+}
+
+model ReceiptLine {
+  id          String  @id @default(cuid())
+  receiptId   String
+  poLineId    String
+  quantity    Decimal @db.Decimal(14, 4)
+  unitCost    Decimal @db.Decimal(14, 4)
+  amount      Decimal @db.Decimal(14, 4)
+
+  receipt Receipt           @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  poLine  PurchaseOrderLine @relation(fields: [poLineId], references: [id])
+
+  @@map("receipt_lines")
+}
+
+enum BillStatus {
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+model Bill {
+  id       String @id @default(cuid())
+  billNo   String // vendor's invoice number
+  vendorId String
+  poId     String?
+  receiptId String?
+  billDate DateTime @default(now())
+  dueDate  DateTime?
+  termsId  String?
+  status   BillStatus @default(OPEN)
+  memo     String?
+
+  subtotal   Decimal @db.Decimal(14, 4)
+  taxTotal   Decimal @default(0) @db.Decimal(14, 4)
+  total      Decimal @db.Decimal(14, 4)
+  amountPaid Decimal @default(0) @db.Decimal(14, 4)
+  balanceDue Decimal @default(0) @db.Decimal(14, 4)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vendor   Vendor         @relation(fields: [vendorId], references: [id])
+  po       PurchaseOrder? @relation(fields: [poId], references: [id])
+  receipt  Receipt?       @relation(fields: [receiptId], references: [id])
+  terms    Terms?         @relation(fields: [termsId], references: [id])
+  lines    BillLine[]
+  payments BillPaymentApplication[]
+  journalEntries JournalEntry[]
+
+  @@unique([vendorId, billNo])
+  @@index([status])
+  @@map("bills")
+}
+
+model BillLine {
+  id          String  @id @default(cuid())
+  billId      String
+  lineNo      Int
+  productId   String?
+  accountId   String?
+  description String
+  quantity    Decimal @default(1) @db.Decimal(14, 4)
+  unitCost    Decimal @db.Decimal(14, 4)
+  amount      Decimal @db.Decimal(14, 4)
+
+  bill    Bill     @relation(fields: [billId], references: [id], onDelete: Cascade)
+  account Account? @relation(fields: [accountId], references: [id])
+
+  @@unique([billId, lineNo])
+  @@map("bill_lines")
+}
+
+// ──────────────────────────────────────────── ACCOUNTING / GENERAL LEDGER (ACC)
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  COST_OF_GOODS_SOLD
+  EXPENSE
+  OTHER_INCOME
+  OTHER_EXPENSE
+}
+
+enum AccountSubType {
+  BANK
+  ACCOUNTS_RECEIVABLE
+  INVENTORY
+  OTHER_CURRENT_ASSET
+  FIXED_ASSET
+  ACCOUNTS_PAYABLE
+  CREDIT_CARD
+  OTHER_CURRENT_LIABILITY
+  LONG_TERM_LIABILITY
+  SALES_TAX_PAYABLE
+  EQUITY
+  RETAINED_EARNINGS
+  SALES_INCOME
+  SERVICE_INCOME
+  COGS
+  OPERATING_EXPENSE
+  OTHER
+}
+
+model Account {
+  id       String      @id @default(cuid())
+  number   String      @unique // "1200"
+  name     String
+  type     AccountType
+  subType  AccountSubType @default(OTHER)
+  parentId String?
+  description String?
+  isActive Boolean     @default(true)
+  // Running balance, maintained transactionally alongside JournalLine writes.
+  balance  Decimal     @default(0) @db.Decimal(14, 4)
+  // true for system accounts the posting engine depends on (A/R, Inventory,
+  // Sales Tax Payable). Blocks deletion.
+  isSystem Boolean     @default(false)
+  createdAt DateTime   @default(now())
+
+  parent   Account?  @relation("AccountTree", fields: [parentId], references: [id])
+  children Account[] @relation("AccountTree")
+
+  journalLines JournalLine[]
+  billLines    BillLine[]
+  itemIncome    Product[] @relation("ItemIncome")
+  itemCogs      Product[] @relation("ItemCogs")
+  itemInventory Product[] @relation("ItemInventory")
+
+  @@index([type])
+  @@map("accounts")
+}
+
+enum JournalSource {
+  INVOICE
+  INVOICE_VOID
+  CUSTOMER_PAYMENT
+  BILL
+  BILL_PAYMENT
+  INVENTORY_RECEIPT
+  INVENTORY_ADJUSTMENT
+  MANUAL
+}
+
+// Double-entry header. Invariant enforced in src/lib/ledger.ts:
+// SUM(debit) == SUM(credit) for every entry, checked before commit.
+model JournalEntry {
+  id          String        @id @default(cuid())
+  entryNo     String        @unique
+  entryDate   DateTime      @default(now())
+  source      JournalSource
+  memo        String?
+  referenceType String?
+  referenceId   String?
+  invoiceId   String?
+  billId      String?
+  // Totals must be equal; stored for cheap trial-balance verification.
+  totalDebit  Decimal @db.Decimal(14, 4)
+  totalCredit Decimal @db.Decimal(14, 4)
+  isReversal  Boolean @default(false)
+  reversesId  String?
+  createdById String
+  createdAt   DateTime @default(now())
+
+  lines     JournalLine[]
+  invoice   Invoice?  @relation(fields: [invoiceId], references: [id])
+  bill      Bill?     @relation(fields: [billId], references: [id])
+  createdBy User      @relation(fields: [createdById], references: [id])
+
+  @@index([entryDate])
+  @@index([source])
+  @@index([referenceType, referenceId])
+  @@map("journal_entries")
+}
+
+model JournalLine {
+  id        String  @id @default(cuid())
+  entryId   String
+  lineNo    Int
+  accountId String
+  debit     Decimal @default(0) @db.Decimal(14, 4)
+  credit    Decimal @default(0) @db.Decimal(14, 4)
+  memo      String?
+  // Who this line is "for" — drives A/R and A/P aging without extra tables.
+  customerId String?
+  vendorId   String?
+
+  entry   JournalEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  account Account      @relation(fields: [accountId], references: [id])
+
+  @@unique([entryId, lineNo])
+  @@index([accountId])
+  @@map("journal_lines")
+}
+
+// ────────────────────────────────────────────────────────────────── PAYMENTS
+
+enum PaymentMethod {
+  CASH
+  CHECK
+  CREDIT_CARD
+  ACH
+  STORE_CREDIT
+  OTHER
+}
+
+model CustomerPayment {
+  id          String        @id @default(cuid())
+  paymentNo   String        @unique
+  customerId  String
+  paymentDate DateTime      @default(now())
+  method      PaymentMethod @default(CHECK)
+  referenceNo String?       // check number
+  amount      Decimal       @db.Decimal(14, 4)
+  unapplied   Decimal       @default(0) @db.Decimal(14, 4)
+  depositAccountId String?
+  memo        String?
+  createdById String?
+  createdAt   DateTime      @default(now())
+
+  customer     Customer             @relation(fields: [customerId], references: [id])
+  createdBy    User?                @relation("CustomerPaymentCreatedBy", fields: [createdById], references: [id])
+  applications PaymentApplication[]
+
+  @@index([customerId])
+  @@map("customer_payments")
+}
+
+model PaymentApplication {
+  id        String  @id @default(cuid())
+  paymentId String
+  invoiceId String
+  amount    Decimal @db.Decimal(14, 4)
+
+  payment CustomerPayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoice Invoice         @relation(fields: [invoiceId], references: [id])
+
+  @@unique([paymentId, invoiceId])
+  @@map("payment_applications")
+}
+
+model BillPayment {
+  id          String        @id @default(cuid())
+  paymentNo   String        @unique
+  vendorId    String
+  paymentDate DateTime      @default(now())
+  method      PaymentMethod @default(CHECK)
+  referenceNo String?
+  amount      Decimal       @db.Decimal(14, 4)
+  bankAccountId String?
+  memo        String?
+  createdById String?
+  createdAt   DateTime      @default(now())
+
+  createdBy    User?                   @relation("BillPaymentCreatedBy", fields: [createdById], references: [id])
+  applications BillPaymentApplication[]
+
+  @@index([vendorId])
+  @@map("bill_payments")
+}
+
+model BillPaymentApplication {
+  id            String  @id @default(cuid())
+  billPaymentId String
+  billId        String
+  amount        Decimal @db.Decimal(14, 4)
+
+  billPayment BillPayment @relation(fields: [billPaymentId], references: [id], onDelete: Cascade)
+  bill        Bill        @relation(fields: [billId], references: [id])
+
+  @@unique([billPaymentId, billId])
+  @@map("bill_payment_applications")
+}
+
+// ──────────────────────────────────────────────────────── AUDIT TRAIL (AUD)
+
+enum AuditAction {
+  LOGIN
+  LOGIN_FAILED
+  LOGOUT
+  CREATE
+  UPDATE
+  DELETE
+  VOID
+  POST
+  PRICE_OVERRIDE_REQUESTED
+  PRICE_OVERRIDE_APPROVED
+  PRICE_OVERRIDE_DENIED
+  PERMISSION_DENIED
+  COST_VIEW
+  EXPORT
+  RECEIVE
+  PAYMENT
+}
+
+// Append-only. There is no update or delete path in the application for this
+// table; a Postgres trigger (see migration) raises on UPDATE/DELETE.
+model AuditLog {
+  id        String      @id @default(cuid())
+  action    AuditAction
+  entity    String      // "Invoice", "Product", "User"
+  entityId  String?
+  userId    String?
+  // Denormalized so the log survives user deletion and reads without a join.
+  userLabel String?
+  roleCode  String?
+  summary   String
+  // Field-level before/after for UPDATE actions.
+  changes   Json?
+  ipAddress String?
+  userAgent String?
+  // Elevated severity for the compliance report: overrides, denials, voids.
+  isSensitive Boolean  @default(false)
+  createdAt DateTime   @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@index([entity, entityId])
+  @@index([userId])
+  @@index([action])
+  @@index([isSensitive, createdAt])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────────────────────── COMPANY/SEQ
+
+model CompanySettings {
+  id        String @id @default("default")
+  legalName String @default("Gill Truck Parts")
+  address1  String?
+  city      String?
+  state     String?
+  postalCode String?
+  phone     String?
+  email     String?
+  taxId     String?
+  fiscalYearStartMonth Int @default(1)
+  // Hard switch: when false, no below-minimum sale is possible at all, even
+  // with a manager code.
+  allowPriceOverride Boolean @default(true)
+  defaultTaxCodeId   String?
+  updatedAt DateTime @updatedAt
+
+  @@map("company_settings")
+}
+
+// Gap-free document numbering. Incremented inside the same transaction as
+// the document it names, so two counter terminals can never collide.
+model DocumentSequence {
+  id        String @id @default(cuid())
+  key       String @unique // "INVOICE" | "PO" | "RECEIPT" | "JOURNAL"
+  prefix    String @default("")
+  nextValue Int    @default(1)
+  padding   Int    @default(5)
+
+  @@map("document_sequences")
+}

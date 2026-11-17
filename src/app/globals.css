@@ -1,0 +1,265 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    @apply font-qb text-qb text-qb-ink;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-qb-chrome;
+    /* The app is a fixed desktop shell; only panes scroll. */
+    overflow: hidden;
+  }
+  /* QB Desktop disables text selection on chrome, keeps it in data areas. */
+  .qb-chrome-nosel { user-select: none; }
+
+  /* Narrow, square scrollbars like a Win32 app. */
+  ::-webkit-scrollbar { width: 14px; height: 14px; }
+  ::-webkit-scrollbar-track { background: #F0F0F0; border-left: 1px solid #D4D4D4; }
+  ::-webkit-scrollbar-thumb {
+    background: #C8CDD2; border: 1px solid #ABADB3;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #B0B6BC; }
+  ::-webkit-scrollbar-corner { background: #F0F0F0; }
+
+  /* Remove the number-input spinners: QB uses plain text fields. */
+  input[type="number"]::-webkit-outer-spin-button,
+  input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type="number"] { -moz-appearance: textfield; }
+
+  *:focus-visible { outline: none; }
+}
+
+@layer components {
+  /* ─────────────────────────────────────────────────── Window / form chrome */
+
+  /* A floating "document window" — the Create Invoices window, a list, etc. */
+  .qb-window {
+    @apply bg-white border border-qb-border shadow-qb-window;
+  }
+  .qb-window-title {
+    @apply bg-qb-title text-white text-qb-md font-bold px-2 h-[24px]
+           flex items-center justify-between select-none;
+  }
+  /* The light blue tab strip under a transaction window's title bar. */
+  .qb-ribbon {
+    @apply bg-qb-ribbon border-b border-qb-ribbonLine px-1 pt-1
+           flex items-end gap-0 select-none;
+  }
+  .qb-ribbon-tab {
+    @apply text-qb px-3 h-[20px] flex items-center border border-transparent
+           border-b-0 cursor-pointer text-qb-inkMuted;
+  }
+  .qb-ribbon-tab-active {
+    @apply bg-white border-qb-ribbonLine text-qb-ink font-bold
+           relative top-[1px];
+  }
+  /* Grouped command strip inside the ribbon, with a caption underneath. */
+  .qb-ribbon-group {
+    @apply flex flex-col items-center px-2 border-r border-qb-ribbonLine/60;
+  }
+  .qb-ribbon-group-label {
+    @apply text-qb-xs text-qb-inkMuted pt-[2px];
+  }
+
+  /* ──────────────────────────────────────────────────────────────── Buttons */
+
+  .qb-btn {
+    @apply bg-qb-btn border border-qb-border rounded-qb text-qb px-3 h-[22px]
+           inline-flex items-center justify-center gap-1 shadow-qb-btn
+           cursor-pointer select-none whitespace-nowrap text-qb-ink;
+  }
+  .qb-btn:hover:not(:disabled) { @apply bg-qb-btn-hover border-qb-field; }
+  .qb-btn:active:not(:disabled) { @apply shadow-qb-btn-active bg-qb-chromeDark; }
+  .qb-btn:disabled {
+    @apply text-qb-inkDisabled cursor-not-allowed shadow-none bg-qb-chromeDark;
+  }
+  .qb-btn:focus-visible { @apply ring-1 ring-qb-blue ring-offset-0; }
+
+  .qb-btn-primary {
+    @apply bg-qb-green border-qb-greenDark text-white font-bold;
+  }
+  .qb-btn-primary:hover:not(:disabled) {
+    @apply bg-qb-greenDark border-qb-greenDark;
+    background-image: none;
+  }
+  .qb-btn-sm { @apply h-[18px] px-2 text-qb-xs; }
+  /* Tiny square button, e.g. the dropdown arrow welded to a combo field. */
+  .qb-btn-icon {
+    @apply w-[18px] h-[20px] p-0 border border-qb-border bg-qb-btn
+           inline-flex items-center justify-center cursor-pointer
+           shadow-qb-btn text-qb-inkMuted;
+  }
+  .qb-btn-icon:hover { @apply bg-qb-btn-hover; }
+
+  /* ───────────────────────────────────────────────────────────────── Fields */
+
+  .qb-label {
+    @apply text-qb text-qb-ink select-none;
+  }
+  .qb-input {
+    @apply h-[20px] px-[3px] bg-white border border-qb-field text-qb
+           text-qb-ink shadow-qb-inset w-full;
+  }
+  .qb-input:focus { @apply border-qb-fieldFocus ring-1 ring-qb-blue/30; }
+  .qb-input:disabled, .qb-input[readonly] {
+    @apply bg-qb-chromeDark text-qb-inkMuted shadow-none;
+  }
+  .qb-input-err { @apply border-qb-red bg-qb-errBg; }
+  /* Money and quantity are right-aligned and tabular, always. */
+  .qb-input-num { @apply text-right font-qbMono; }
+  .qb-select {
+    @apply h-[20px] pl-[3px] pr-5 bg-white border border-qb-field text-qb
+           text-qb-ink shadow-qb-inset w-full appearance-none;
+    /* The Win32 drop-down triangle. Written as plain CSS rather than an
+       arbitrary `bg-[url(...)]` utility because the data URI contains
+       spaces, which Tailwind's class parser cannot carry through @apply. */
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath fill='%235A5A5A' d='M0 0h8L4 5z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 5px center;
+  }
+  .qb-checkbox {
+    @apply w-[13px] h-[13px] border border-qb-field bg-white
+           accent-qb-blue align-middle;
+  }
+  /* The "field is a lookup" affordance: a combo box with an arrow. */
+  .qb-combo { @apply flex items-stretch w-full; }
+  .qb-combo > .qb-input { @apply border-r-0; }
+
+  /* ────────────────────────────────────────────────────────── Data grid */
+
+  .qb-grid {
+    @apply w-full border-collapse text-qb;
+    /* Fixed layout keeps columns from jumping as the user types. */
+    table-layout: fixed;
+  }
+  .qb-grid thead th {
+    @apply bg-qb-grid-header border border-qb-gridLine text-qb-ink font-bold
+           h-[20px] px-[4px] text-left select-none sticky top-0 z-10
+           whitespace-nowrap;
+  }
+  .qb-grid tbody td {
+    @apply border border-qb-gridLine h-[20px] px-[4px] align-middle
+           overflow-hidden whitespace-nowrap text-ellipsis;
+  }
+  .qb-grid tbody tr:nth-child(even) { @apply bg-qb-gridStripe; }
+  .qb-grid tbody tr:hover { @apply bg-qb-menuHover; }
+  .qb-grid tbody tr.qb-row-selected {
+    @apply bg-qb-gridSelect;
+    box-shadow: inset 0 0 0 1px #3399FF;
+  }
+  .qb-grid-num { @apply text-right font-qbMono; }
+  /* An input that sits flush inside a grid cell with no visible chrome
+     until focused — the QuickBooks line-item editing behaviour. */
+  .qb-cell-input {
+    @apply w-full h-[18px] px-[2px] bg-transparent border border-transparent
+           text-qb text-qb-ink;
+  }
+  .qb-cell-input:hover { @apply border-qb-line bg-white; }
+  .qb-cell-input:focus {
+    @apply bg-white border-qb-fieldFocus ring-1 ring-qb-blue/30 relative z-10;
+  }
+  .qb-cell-input-num { @apply text-right font-qbMono; }
+  .qb-cell-input-err { @apply bg-qb-errBg border-qb-red; }
+
+  /* ────────────────────────────────────────────────────────────── Menu bar */
+
+  .qb-menubar {
+    @apply bg-qb-menu border-b border-qb-line h-[22px] flex items-stretch
+           text-qb select-none;
+  }
+  .qb-menubar-item {
+    @apply px-[9px] flex items-center cursor-pointer text-qb-ink;
+  }
+  .qb-menubar-item:hover, .qb-menubar-item-open {
+    @apply bg-qb-menuHover border-x border-qb-ribbonLine;
+  }
+  .qb-dropdown {
+    @apply absolute bg-white shadow-qb-dropdown py-[2px] min-w-[200px] z-50;
+  }
+  .qb-dropdown-item {
+    @apply flex items-center justify-between gap-6 px-6 h-[20px] text-qb
+           cursor-pointer text-qb-ink;
+  }
+  .qb-dropdown-item:hover { @apply bg-qb-blue text-white; }
+  .qb-dropdown-item-disabled {
+    @apply text-qb-inkDisabled pointer-events-none;
+  }
+  .qb-dropdown-sep { @apply my-[3px] border-t border-qb-line mx-1; }
+
+  /* ──────────────────────────────────────────────────────── Left icon bar */
+
+  .qb-iconbar { @apply bg-qb-bar text-qb-barText flex flex-col select-none; }
+  .qb-iconbar-section {
+    @apply text-qb-xs uppercase tracking-wide text-qb-barText/55 px-3 pt-3 pb-1;
+  }
+  .qb-iconbar-item {
+    @apply flex items-center gap-2 px-3 h-[24px] text-qb cursor-pointer
+           text-qb-barText border-l-[3px] border-transparent;
+  }
+  .qb-iconbar-item:hover { @apply bg-qb-barHover text-white; }
+  .qb-iconbar-item-active {
+    @apply bg-qb-barActive text-white border-l-qb-blue font-bold;
+  }
+
+  /* ─────────────────────────────────────────────────────────── Status bar */
+
+  .qb-statusbar {
+    @apply bg-qb-chrome border-t border-qb-border h-[22px] flex items-center
+           text-qb-xs text-qb-inkMuted select-none;
+  }
+  .qb-statusbar-cell {
+    @apply px-2 h-full flex items-center border-r border-qb-line;
+  }
+
+  /* ──────────────────────────────────────────────────────────── Feedback */
+
+  .qb-banner {
+    @apply flex items-start gap-2 px-2 py-1 text-qb border;
+  }
+  .qb-banner-warn { @apply bg-qb-warnBg border-qb-warnBorder text-qb-ink; }
+  .qb-banner-err  { @apply bg-qb-errBg border-qb-errBorder text-qb-red; }
+  .qb-banner-ok   { @apply bg-qb-okBg border-qb-green/40 text-qb-greenDark; }
+
+  /* Field-level validation text under an input. */
+  .qb-field-err { @apply text-qb-xs text-qb-red pt-[1px]; }
+
+  /* A group box with a caption, like QB's "Terms"/"Tax" panels. */
+  .qb-fieldset {
+    @apply border border-qb-line bg-qb-chromeAlt px-2 py-1;
+  }
+  .qb-fieldset-legend {
+    @apply text-qb-xs font-bold uppercase tracking-wide text-qb-inkMuted;
+  }
+
+  /* Pill for status columns in lists. */
+  .qb-pill {
+    @apply inline-flex items-center h-[14px] px-[5px] text-qb-xs font-bold
+           uppercase tracking-wide border rounded-sm;
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────── Printing */
+
+@media print {
+  /* Everything that is application chrome disappears; only the document
+     itself reaches the paper. */
+  .qb-no-print { display: none !important; }
+  html, body {
+    overflow: visible !important;
+    background: #fff !important;
+    font-size: 11pt;
+  }
+  .qb-print-sheet {
+    box-shadow: none !important;
+    border: none !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+  }
+  @page { size: letter portrait; margin: 0.5in; }
+  thead { display: table-header-group; }
+  tr { page-break-inside: avoid; }
+}
